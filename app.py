@@ -84,7 +84,7 @@ class AudioDenoiserApp:
         self.master.title("Audio Denoiser")
 
         # Audio Configuration
-        self.CHUNK = 8192  # Number of samples per frame
+        self.CHUNK = 4096  # Number of samples per frame
         self.FORMAT = pyaudio.paInt16  # 16-bit resolution
         self.CHANNELS = 1  # Mono audio
         self.RATE = 44100  # Sampling rate in Hz
