@@ -78,373 +78,363 @@ def run_model(onnx_session, wav: np.array, sample_rate: int, batch_process_chunk
     res = res_chunks.reshape(-1)
     return res[:wav.shape[-1]], 44100
 
-class AudioDenoiserApp:
-    def __init__(self, master):
-        self.master = master
-        self.master.title("Audio Denoiser")
+# Audio configuration
+CHUNK = 4096 #4096 #8192  # Number of samples per frame
+FORMAT = pyaudio.paInt16  # 16-bit resolution
+CHANNELS = 1  # Mono audio
+RATE = 44100  # Sampling rate in Hz
 
-        # Audio Configuration
-        self.CHUNK = 4096  # Number of samples per frame
-        self.FORMAT = pyaudio.paInt16  # 16-bit resolution
-        self.CHANNELS = 1  # Mono audio
-        self.RATE = 44100  # Sampling rate in Hz
+# Queues for communication between threads
+read_queue = queue.Queue(maxsize=300)      # Holds raw audio frames from the microphone
+process_queue = queue.Queue(maxsize=300)   # Holds processed audio frames ready for playback
 
-        self.device = "cpu"  # Use "cuda" if GPU is available and compatible
+# Flags to control threading
+processing_stop_flag = threading.Event()
+playback_stop_flag = threading.Event()
 
-        # Queues for communication between threads
-        self.read_queue = queue.Queue(maxsize=300)      # Holds raw audio frames from the microphone
-        self.process_queue = queue.Queue(maxsize=300)   # Holds processed audio frames ready for playback
+# Initialize PyAudio
+pa = pyaudio.PyAudio()
 
-        # Flag to control threading
-        self.stop_flag = threading.Event()
-        self.threads = []
+# Get default input and output device indices
+try:
+    default_input_device_info = pa.get_default_input_device_info()
+    default_input_device_index = default_input_device_info['index']
+    default_input_device_name = f"{default_input_device_index}: {default_input_device_info['name']}"
+except IOError:
+    logging.error("No default input device found.")
+    default_input_device_index = None
+    default_input_device_name = ""
 
-        # Initialize PyAudio
-        self.pa = pyaudio.PyAudio()
+try:
+    default_output_device_info = pa.get_default_output_device_info()
+    default_output_device_index = default_output_device_info['index']
+    default_output_device_name = f"{default_output_device_index}: {default_output_device_info['name']}"
+except IOError:
+    logging.error("No default output device found.")
+    default_output_device_index = None
+    default_output_device_name = ""
 
-        # Get default input and output device indices
-        try:
-            self.default_input_device_index = self.pa.get_default_input_device_info()['index']
-            self.default_output_device_index = self.pa.get_default_output_device_info()['index']
-        except IOError:
-            logging.error("No default input/output device found.")
-            self.default_input_device_index = None
-            self.default_output_device_index = None
+# Set up ONNX runtime session
+opts = onnxruntime.SessionOptions()
+opts.inter_op_num_threads = 4
+opts.intra_op_num_threads = 4
+opts.log_severity_level = 4
 
-        # Set up ONNX runtime session
-        self.session = self.setup_onnx_session()
+try:
+    session = onnxruntime.InferenceSession(
+        'denoiser.onnx',
+        providers=["CPUExecutionProvider"],
+        sess_options=opts,
+    )
+    logging.info("ONNX model loaded successfully.")
+except Exception as e:
+    logging.error(f"Failed to load ONNX model: {e}")
+    session = None
 
-        # Initialize GUI components
-        self.create_widgets()
+def get_audio_devices():
+    """Get lists of input and output audio devices."""
+    input_devices = []
+    output_devices = []
+    for i in range(pa.get_device_count()):
+        device_info = pa.get_device_info_by_index(i)
+        device_name = f"{i}: {device_info.get('name')}"
+        if device_info.get('maxInputChannels') > 0:
+            input_devices.append(device_name)
+        if device_info.get('maxOutputChannels') > 0:
+            output_devices.append(device_name)
+    return input_devices, output_devices
 
-    def setup_onnx_session(self):
-        opts = onnxruntime.SessionOptions()
-        opts.inter_op_num_threads = 4
-        opts.intra_op_num_threads = 4
-        opts.log_severity_level = 4
+def update_device_lists():
+    """Update the device lists and refresh dropdowns."""
+    logging.info("Refreshing audio devices...")
+    input_devices, output_devices = get_audio_devices()
 
-        try:
-            session = onnxruntime.InferenceSession(
-                'denoiser.onnx',
-                providers=["CPUExecutionProvider"],
-                sess_options=opts,
-            )
-            logging.info("ONNX model loaded successfully.")
-            return session
-        except Exception as e:
-            logging.error(f"Failed to load ONNX model: {e}")
-            return None
-
-    def create_widgets(self):
-        # Input device dropdown
-        self.input_device_var = tk.StringVar()
-        self.input_label = ttk.Label(self.master, text="Input Device:")
-        self.input_label.grid(row=0, column=0, padx=5, pady=5, sticky='e')
-
-        self.input_dropdown = ttk.Combobox(self.master, textvariable=self.input_device_var, state="readonly", width=50)
-        self.input_dropdown.grid(row=0, column=1, padx=5, pady=5)
-        self.populate_input_devices()
-
-        # Output device dropdown
-        self.output_device_var = tk.StringVar()
-        self.output_label = ttk.Label(self.master, text="Output Device:")
-        self.output_label.grid(row=1, column=0, padx=5, pady=5, sticky='e')
-
-        self.output_dropdown = ttk.Combobox(self.master, textvariable=self.output_device_var, state="readonly", width=50)
-        self.output_dropdown.grid(row=1, column=1, padx=5, pady=5)
-        self.populate_output_devices()
-
-        # Refresh Devices button
-        self.refresh_button = ttk.Button(self.master, text="Refresh Audio Devices", command=self.update_device_lists)
-        self.refresh_button.grid(row=2, column=0, columnspan=2, padx=5, pady=5)
-
-        # Toggle button
-        self.toggle_button = ttk.Button(self.master, text="Start", command=self.toggle_processing)
-        self.toggle_button.grid(row=3, column=0, columnspan=2, padx=5, pady=10)
-
-    def populate_input_devices(self):
-        input_devices, _ = self.get_audio_devices()
-        if not input_devices:
-            logging.warning("No input devices found.")
-        # Set default input device
-        if self.default_input_device_index is not None:
-            default_input_device_name = f"{self.default_input_device_index}: {self.pa.get_device_info_by_index(self.default_input_device_index).get('name')}"
-            if default_input_device_name in input_devices:
-                self.input_device_var.set(default_input_device_name)
-            else:
-                self.input_device_var.set(input_devices[0] if input_devices else "")
-        self.input_dropdown['values'] = input_devices
-
-    def populate_output_devices(self):
-        _, output_devices = self.get_audio_devices()
-        if not output_devices:
-            logging.warning("No output devices found.")
-        # Set default output device
-        if self.default_output_device_index is not None:
-            default_output_device_name = f"{self.default_output_device_index}: {self.pa.get_device_info_by_index(self.default_output_device_index).get('name')}"
-            if default_output_device_name in output_devices:
-                self.output_device_var.set(default_output_device_name)
-            else:
-                self.output_device_var.set(output_devices[0] if output_devices else "")
-        self.output_dropdown['values'] = output_devices
-
-    def get_audio_devices(self):
-        """Get lists of input and output audio devices."""
-        input_devices = []
-        output_devices = []
-        for i in range(self.pa.get_device_count()):
-            device_info = self.pa.get_device_info_by_index(i)
-            device_name = f"{i}: {device_info.get('name')}"
-            if device_info.get('maxInputChannels') > 0:
-                input_devices.append(device_name)
-            if device_info.get('maxOutputChannels') > 0:
-                output_devices.append(device_name)
-        return input_devices, output_devices
-
-    def update_device_lists(self):
-        """Update the device lists and refresh dropdowns."""
-        logging.info("Refreshing audio devices...")
-        input_devices, output_devices = self.get_audio_devices()
-
-        # Update input devices
-        current_input = self.input_device_var.get()
-        self.input_dropdown['values'] = input_devices
-        if current_input not in input_devices:
-            # Reset to default or first available
-            if self.default_input_device_index is not None:
-                default_input_device_name = f"{self.default_input_device_index}: {self.pa.get_device_info_by_index(self.default_input_device_index).get('name')}"
-                if default_input_device_name in input_devices:
-                    self.input_device_var.set(default_input_device_name)
-                elif input_devices:
-                    self.input_device_var.set(input_devices[0])
-                else:
-                    self.input_device_var.set("")
-            elif input_devices:
-                self.input_device_var.set(input_devices[0])
-            else:
-                self.input_device_var.set("")
-
-        # Update output devices
-        current_output = self.output_device_var.get()
-        self.output_dropdown['values'] = output_devices
-        if current_output not in output_devices:
-            # Reset to default or first available
-            if self.default_output_device_index is not None:
-                default_output_device_name = f"{self.default_output_device_index}: {self.pa.get_device_info_by_index(self.default_output_device_index).get('name')}"
-                if default_output_device_name in output_devices:
-                    self.output_device_var.set(default_output_device_name)
-                elif output_devices:
-                    self.output_device_var.set(output_devices[0])
-                else:
-                    self.output_device_var.set("")
-            elif output_devices:
-                self.output_device_var.set(output_devices[0])
-            else:
-                self.output_device_var.set("")
-
-    def toggle_processing(self):
-        if self.toggle_button.config('text')[-1] == 'Start':
-            self.toggle_button.config(text='Stop')
-            self.start_processing()
+    # Update input devices
+    current_input = input_device_var.get()
+    input_dropdown['values'] = input_devices
+    if current_input not in input_devices:
+        # Reset to default or first available
+        if default_input_device_name in input_devices:
+            input_device_var.set(default_input_device_name)
+        elif input_devices:
+            input_device_var.set(input_devices[0])
         else:
-            self.toggle_button.config(text='Start')
-            self.stop_processing()
+            input_device_var.set("")
+        logging.info("Input device selection updated.")
 
-    def start_processing(self):
-        if self.session is None:
-            logging.error("ONNX session is not initialized.")
-            return
+    # Update output devices
+    current_output = output_device_var.get()
+    output_dropdown['values'] = output_devices
+    if current_output not in output_devices:
+        # Reset to default or first available
+        if default_output_device_name in output_devices:
+            output_device_var.set(default_output_device_name)
+        elif output_devices:
+            output_device_var.set(output_devices[0])
+        else:
+            output_device_var.set("")
+        logging.info("Output device selection updated.")
 
-        self.stop_flag.clear()
+def start_processing():
+    global input_stream, output_stream, threads, processing_stop_flag, playback_stop_flag, read_queue, process_queue
 
-        # Reinitialize the queues
-        self.read_queue = queue.Queue(maxsize=300)
-        self.process_queue = queue.Queue(maxsize=300)
+    if session is None:
+        logging.error("ONNX session is not initialized.")
+        return
 
-        # Get selected input and output device indices
-        input_selection = self.input_device_var.get()
-        output_selection = self.output_device_var.get()
+    logging.info("Starting audio processing...")
+    processing_stop_flag.clear()
+    playback_stop_flag.clear()
 
-        if input_selection == "":
-            logging.error("Please select an input device.")
-            return
-        if output_selection == "":
-            logging.error("Please select an output device.")
-            return
+    # Reinitialize the queues
+    read_queue = queue.Queue(maxsize=300)
+    process_queue = queue.Queue(maxsize=300)
 
-        input_device_index = int(input_selection.split(":")[0])
-        output_device_index = int(output_selection.split(":")[0])
+    # Get selected input and output device indices
+    input_selection = input_device_var.get()
+    output_selection = output_device_var.get()
 
-        try:
-            # Open PyAudio input stream (microphone)
-            self.input_stream = self.pa.open(format=self.FORMAT,
-                                            channels=self.CHANNELS,
-                                            rate=self.RATE,
-                                            input=True,
-                                            frames_per_buffer=self.CHUNK,
-                                            input_device_index=input_device_index,
-                                            start=False)
+    if input_selection == "":
+        logging.error("Please select an input device.")
+        return
+    if output_selection == "":
+        logging.error("Please select an output device.")
+        return
 
-            # Open PyAudio output stream
-            self.output_stream = self.pa.open(format=self.FORMAT,
-                                             channels=self.CHANNELS,
-                                             rate=self.RATE,
-                                             output=True,
-                                             frames_per_buffer=self.CHUNK,
-                                             output_device_index=output_device_index,
-                                             start=False)
+    input_device_index = int(input_selection.split(":")[0])
+    output_device_index = int(output_selection.split(":")[0])
 
-            # Start the streams
-            self.input_stream.start_stream()
-            self.output_stream.start_stream()
-            logging.info("Audio streams started.")
+    try:
+        # Open PyAudio input stream (microphone)
+        input_stream = pa.open(format=FORMAT,
+                               channels=CHANNELS,
+                               rate=RATE,
+                               input=True,
+                               frames_per_buffer=CHUNK,
+                               input_device_index=input_device_index,
+                               start=False)
 
-            # Start threads
-            self.threads = []
-            read_thread = threading.Thread(target=self.read_audio, name="ReadThread")
-            process_thread = threading.Thread(target=self.process_audio, name="ProcessThread")
-            playback_thread = threading.Thread(target=self.playback_audio, name="PlaybackThread")
+        # Open PyAudio output stream
+        output_stream = pa.open(format=FORMAT,
+                                channels=CHANNELS,
+                                rate=RATE,
+                                output=True,
+                                frames_per_buffer=CHUNK,
+                                output_device_index=output_device_index,
+                                start=False)
 
-            for t in [read_thread, process_thread, playback_thread]:
-                t.daemon = True
-                t.start()
-                self.threads.append(t)
+        # Start the streams
+        input_stream.start_stream()
+        output_stream.start_stream()
+        logging.info("Audio streams started.")
 
-            logging.info("Audio processing threads started.")
+        # Start threads
+        threads = []
+        read_thread = threading.Thread(target=read_audio, name="ReadThread")
+        process_thread = threading.Thread(target=process_audio, name="ProcessThread")
+        playback_thread = threading.Thread(target=playback_audio, name="PlaybackThread")
 
-        except Exception as e:
-            logging.error(f"Failed to start audio processing: {e}")
-            self.stop_flag.set()
-            self.toggle_button.config(text="Start")
+        for t in [read_thread, process_thread, playback_thread]:
+            t.daemon = True
+            t.start()
+            threads.append(t)
 
-    def stop_processing(self):
-        logging.info("Stopping audio processing...")
-        self.stop_flag.set()
+        logging.info("Audio processing threads started.")
 
-        # Wait for threads to finish
-        for t in self.threads:
-            t.join(timeout=1)
+    except Exception as e:
+        logging.error(f"Failed to start audio processing: {e}")
+        stop_processing()
 
-        # Close the streams
-        try:
-            if hasattr(self, 'input_stream') and self.input_stream.is_active():
-                self.input_stream.stop_stream()
-                self.input_stream.close()
-                logging.info("Input stream closed.")
-        except Exception as e:
-            logging.error(f"Error closing input stream: {e}")
+def stop_processing():
+    global input_stream, output_stream, threads, processing_stop_flag, playback_stop_flag
 
-        try:
-            if hasattr(self, 'output_stream') and self.output_stream.is_active():
-                self.output_stream.stop_stream()
-                self.output_stream.close()
-                logging.info("Output stream closed.")
-        except Exception as e:
-            logging.error(f"Error closing output stream: {e}")
+    logging.info("Stopping audio processing...")
+    processing_stop_flag.set()  # Signal to stop read and process threads
 
-        # Reset streams
-        self.input_stream = None
-        self.output_stream = None
+    # Wait for read and process threads to finish
+    for t in threads[:2]:  # Assuming first two threads are read and process
+        t.join(timeout=1)
+        if t.is_alive():
+            logging.warning(f"{t.name} did not terminate gracefully.")
 
-        # Clear the threads list
-        self.threads = []
+    # At this point, playback_audio thread is still running to drain the queue
+    playback_stop_flag.set()  # Signal playback_audio to stop after draining
 
-    def read_audio(self):
-        """Thread function to read audio frames from the microphone."""
-        logging.info("Read thread started.")
-        try:
-            while not self.stop_flag.is_set():
+    # Wait for playback_audio thread to finish
+    playback_thread = threads[2]
+    playback_thread.join(timeout=5)
+    if playback_thread.is_alive():
+        logging.warning("PlaybackThread did not terminate gracefully.")
+
+    # Close the streams
+    try:
+        if input_stream.is_active():
+            input_stream.stop_stream()
+        input_stream.close()
+        logging.info("Input stream closed.")
+    except Exception as e:
+        logging.error(f"Error closing input stream: {e}")
+
+    try:
+        if output_stream.is_active():
+            output_stream.stop_stream()
+        output_stream.close()
+        logging.info("Output stream closed.")
+    except Exception as e:
+        logging.error(f"Error closing output stream: {e}")
+
+    # Clear the threads list
+    threads = []
+    logging.info("Audio processing stopped.")
+
+def toggle_processing():
+    if toggle_button.config('text')[-1] == 'Start':
+        toggle_button.config(text='Stop')
+        start_processing()
+    else:
+        toggle_button.config(text='Start')
+        stop_processing()
+
+def read_audio():
+    """Thread function to read audio frames from the microphone."""
+    logging.info("Read thread started.")
+    try:
+        while not processing_stop_flag.is_set():
+            try:
+                audio_data = input_stream.read(CHUNK, exception_on_overflow=False)
+                read_queue.put(audio_data, timeout=0.5)
+            except queue.Full:
+                logging.warning("Read queue is full. Dropping frame.")
+            except Exception as e:
+                logging.error(f"Error reading audio input: {e}")
+                processing_stop_flag.set()
+                break
+        # Signal the processing thread that reading is done
+        read_queue.put(None)
+        logging.info("Read thread terminated.")
+    except Exception as e:
+        logging.error(f"Exception in read_audio thread: {e}")
+        processing_stop_flag.set()
+
+def process_audio():
+    """Thread function to process audio frames."""
+    logging.info("Process thread started.")
+    try:
+        while not processing_stop_flag.is_set() or not read_queue.empty():
+            try:
+                audio_data = read_queue.get(timeout=1)
+                if audio_data is None:
+                    # End of audio data
+                    process_queue.put(None)
+                    break
+                start_time = time.perf_counter()
+                
+                # Convert bytes to numpy array and normalize
+                audio_np = np.frombuffer(audio_data, dtype=np.int16).astype(np.float32) / 32768.0
+
+                # Process audio using the denoiser
+                clean_audio, new_sr = run_model(session, audio_np, RATE, batch_process_chunks=False)
+
+                # Convert back to numpy and int16
+                clean_audio_np = clean_audio * 32768.0
+                clean_audio_np = np.clip(clean_audio_np, -32768, 32767).astype(np.int16)
+                clean_audio_bytes = clean_audio_np.tobytes()
+
+                processing_time = time.perf_counter() - start_time
+                logging.info(f"Processing time: {processing_time*1000:.2f} ms")
+
                 try:
-                    audio_data = self.input_stream.read(self.CHUNK, exception_on_overflow=False)
-                    self.read_queue.put(audio_data, timeout=0.5)
+                    process_queue.put(clean_audio_bytes, timeout=0.5)
                 except queue.Full:
-                    logging.warning("Read queue is full. Dropping frame.")
-                except Exception as e:
-                    logging.error(f"Error reading audio input: {e}")
-                    self.stop_flag.set()
+                    logging.warning("Process queue is full. Dropping frame.")
+            except queue.Empty:
+                continue
+            except Exception as e:
+                logging.error(f"Error in process_audio: {e}")
+                processing_stop_flag.set()
+                break
+
+        # Signal main thread that processing is done
+        process_queue.put(None)
+        logging.info("Process thread terminated.")
+    except Exception as e:
+        logging.error(f"Exception in process_audio thread: {e}")
+        processing_stop_flag.set()
+
+def playback_audio():
+    """Thread to play back audio."""
+    logging.info("Playback thread started.")
+    try:
+        while not (processing_stop_flag.is_set() and process_queue.empty()):
+            try:
+                clean_audio_bytes = process_queue.get(timeout=1)
+                if clean_audio_bytes is None:
+                    # End of audio data
                     break
-            # Signal the processing thread that reading is done
-            self.read_queue.put(None)
-            logging.info("Read thread terminated.")
-        except Exception as e:
-            logging.error(f"Exception in read_audio thread: {e}")
-            self.stop_flag.set()
+                output_stream.write(clean_audio_bytes, exception_on_underflow=False)
+            except queue.Empty:
+                continue
+            except Exception as e:
+                logging.error(f"Error playing audio: {e}")
+                break
+        logging.info("Playback thread terminating after draining queue.")
+    except Exception as e:
+        logging.error(f"Exception in playback_audio thread: {e}")
 
-    def process_audio(self):
-        """Thread function to process audio frames."""
-        logging.info("Process thread started.")
-        try:
-            while not self.stop_flag.is_set():
-                try:
-                    audio_data = self.read_queue.get(timeout=1)
-                    if audio_data is None:
-                        # End of audio data
-                        self.process_queue.put(None)
-                        break
-                    start_time = time.perf_counter()
-                    
-                    # Convert bytes to numpy array and normalize
-                    audio_np = np.frombuffer(audio_data, dtype=np.int16).astype(np.float32) / 32768.0
+# Set up GUI
+root = tk.Tk()
+root.title("Audio Denoiser")
 
-                    # Process audio using the denoiser
-                    clean_audio, new_sr = run_model(self.session, audio_np, self.RATE, batch_process_chunks=True)
-                    
-                    # Convert back to numpy and int16
-                    clean_audio_np = clean_audio * 32768.0
-                    clean_audio_np = np.clip(clean_audio_np, -32768, 32767).astype(np.int16)
-                    clean_audio_bytes = clean_audio_np.tobytes()
+# Initialize device lists
+input_devices, output_devices = get_audio_devices()
 
-                    processing_time = time.perf_counter() - start_time
-                    logging.info(f"Processing time: {processing_time*1000:.2f} ms")
+# Input device dropdown
+input_device_var = tk.StringVar()
+# Set default input device
+if default_input_device_name in input_devices:
+    input_device_var.set(default_input_device_name)
+elif input_devices:
+    input_device_var.set(input_devices[0])
+else:
+    input_device_var.set("")
 
-                    try:
-                        self.process_queue.put(clean_audio_bytes, timeout=0.5)
-                    except queue.Full:
-                        logging.warning("Process queue is full. Dropping frame.")
-                except queue.Empty:
-                    continue
-                except Exception as e:
-                    logging.error(f"Error in process_audio: {e}")
-                    self.stop_flag.set()
-                    break
+input_label = ttk.Label(root, text="Input Device:")
+input_label.grid(row=0, column=0, padx=5, pady=5, sticky='e')
 
-            # Signal main thread that processing is done
-            self.process_queue.put(None)
-            logging.info("Process thread terminated.")
-        except Exception as e:
-            logging.error(f"Exception in process_audio thread: {e}")
-            self.stop_flag.set()
+input_dropdown = ttk.Combobox(root, textvariable=input_device_var, values=input_devices, state="readonly", width=50)
+input_dropdown.grid(row=0, column=1, padx=5, pady=5)
 
-    def playback_audio(self):
-        """Thread to play back audio."""
-        logging.info("Playback thread started.")
-        try:
-            while not self.stop_flag.is_set():
-                try:
-                    clean_audio_bytes = self.process_queue.get(timeout=1)
-                    if clean_audio_bytes is None:
-                        # End of audio data
-                        break
-                    self.output_stream.write(clean_audio_bytes, exception_on_underflow=False)
-                except queue.Empty:
-                    continue
-                except Exception as e:
-                    logging.error(f"Error playing audio: {e}")
-                    self.stop_flag.set()
-                    break
-            logging.info("Playback thread terminated.")
-        except Exception as e:
-            logging.error(f"Exception in playback_audio thread: {e}")
-            self.stop_flag.set()
+# Output device dropdown
+output_device_var = tk.StringVar()
+# Set default output device
+if default_output_device_name in output_devices:
+    output_device_var.set(default_output_device_name)
+elif output_devices:
+    output_device_var.set(output_devices[0])
+else:
+    output_device_var.set("")
 
-    def on_closing(self):
-        if self.toggle_button['text'] == 'Stop':
-            self.stop_processing()
-        self.pa.terminate()
-        self.master.destroy()
+output_label = ttk.Label(root, text="Output Device:")
+output_label.grid(row=1, column=0, padx=5, pady=5, sticky='e')
 
-if __name__ == "__main__":
-    root = tk.Tk()
-    app = AudioDenoiserApp(root)
-    root.protocol("WM_DELETE_WINDOW", app.on_closing)
-    root.mainloop()
+output_dropdown = ttk.Combobox(root, textvariable=output_device_var, values=output_devices, state="readonly", width=50)
+output_dropdown.grid(row=1, column=1, padx=5, pady=5)
+
+# Refresh Devices button
+refresh_button = ttk.Button(root, text="Refresh Audio Devices", command=update_device_lists)
+refresh_button.grid(row=2, column=0, columnspan=2, padx=5, pady=5)
+
+# Toggle button
+toggle_button = ttk.Button(root, text="Start", command=toggle_processing)
+toggle_button.grid(row=3, column=0, columnspan=2, padx=5, pady=10)
+
+def on_closing():
+    if toggle_button['text'] == 'Stop':
+        stop_processing()
+    pa.terminate()
+    root.destroy()
+
+root.protocol("WM_DELETE_WINDOW", on_closing)
+
+# Run the Tkinter event loop
+root.mainloop()
