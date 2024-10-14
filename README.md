@@ -1,4 +1,4 @@
-# realtime-resemble-noise
+# realtime-resemble-noise-cancellation
 
 An attempt to create real-time noise cancellation using open source [Resemble Enhance](https://github.com/resemble-ai/resemble-enhance) and [Resemble Denoiser in ONNX
 ](https://github.com/skeskinen/resemble-denoise-onnx-inference) project. Thanks for your contribution.
